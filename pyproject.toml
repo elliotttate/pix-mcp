@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pix-mcp"
+version = "0.1.0"
+description = "MCP server for Microsoft PIX (pixtool.exe) — launch, attach, capture, and run fine-grained queries over D3D12 GPU captures."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "pix-mcp" }]
+keywords = ["mcp", "pix", "d3d12", "directx", "gpu", "profiling", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "pydantic>=2.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+pix-mcp = "pix_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/pix-mcp"
+Issues = "https://github.com/your-org/pix-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pix_mcp"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

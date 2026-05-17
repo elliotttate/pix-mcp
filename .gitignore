@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# venv
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# PIX MCP cache / indexes
+*.pixmcp.db
+*.pixmcp.db-journal
+*.pixmcp.db-wal
+*.pixmcp.db-shm
+.pix-mcp-cache/
+
+# PIX captures (don't commit user captures)
+*.wpix
+*.tcap
+captures/
+
+# pixtool logs / scratch
+pixtool.log
+*.pixtool.log
+scratch/
+
+# C++ export directories (large)
+exported_cpp/
+*_export/
