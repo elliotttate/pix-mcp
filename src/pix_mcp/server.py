@@ -18,7 +18,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import cpp_export, csv_parser, index
+from . import cpp_export, csv_parser, index, resources_bin, shaders
 from .config import default_pix_captures_dir, get_settings, reload_settings
 from .pixtool import (
     PixCommand,
@@ -1011,6 +1011,7 @@ def _bindings_to_dict(s: cpp_export.StateAtEvent) -> dict[str, Any]:
         "target_global_id": s.target_global_id,
         "target_call_index": s.target_call_index,
         "applied_calls": s.applied_calls,
+        "found_global_id": s.found_global_id,
         "graphics": {
             "root_signature": gfx.root_signature,
             "pso": gfx.pso,
@@ -1076,6 +1077,13 @@ async def pix_get_resource_at_root_param(
 
     ``pipeline`` is ``"graphics"`` or ``"compute"`` — both root tables are kept
     in parallel and we return the one you ask for.
+
+    For root descriptors backed by a ``GetGpuva(resource_id, offset)`` literal
+    (the common PIX 2603.x form), ``binding`` includes structured
+    ``resource_id`` and ``offset`` keys — feed those straight into
+    ``pix_get_resource_bytes``. Returns ``found_global_id=False`` if the
+    requested ``global_id`` doesn't appear in the export (the binding then
+    reflects end-of-frame state, not the state at your event).
     """
     sess, _wpix = _resolve_wpix(capture)
     if sess is None:
@@ -1088,6 +1096,7 @@ async def pix_get_resource_at_root_param(
         "global_id": global_id,
         "root_param_index": root_param_index,
         "pipeline": pipeline,
+        "found_global_id": state.found_global_id,
         "binding": binding,
         "graphics_pso": state.graphics.pso,
         "compute_pso": state.compute.pso,
@@ -1148,6 +1157,744 @@ async def pix_find_cpp_calls(
             for r in rows
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# raw resource bytes (resources.bin)
+# ---------------------------------------------------------------------------
+
+
+def _hex_preview(data: bytes, *, limit: int = 256) -> str:
+    sl = data[:limit]
+    return " ".join(f"{b:02x}" for b in sl)
+
+
+def _decode_floats(data: bytes, count: int) -> list[float] | None:
+    import struct
+    if count <= 0:
+        return None
+    need = count * 4
+    if len(data) < need:
+        return None
+    return list(struct.unpack(f"<{count}f", data[:need]))
+
+
+def _decode_32bit_constants(binding: dict[str, Any]) -> dict[str, Any]:
+    """Interpret a root 32BIT_CONSTANTS binding's captured slot values.
+
+    The state replay stored individual ``SetGraphics/ComputeRoot32BitConstant``
+    calls as ``binding['values'][slot] = "<raw arg>"`` and a single
+    ``SetGraphics/ComputeRoot32BitConstants`` call as ``binding['raw']`` with
+    the whole argument string. We decode the per-slot values to int / float
+    where possible so callers don't have to parse the string forms themselves.
+    """
+    import struct
+    out: dict[str, Any] = {}
+    values = binding.get("values")
+    if isinstance(values, dict):
+        slots: dict[int, dict[str, Any]] = {}
+        for slot, raw in values.items():
+            entry: dict[str, Any] = {"raw": raw}
+            if isinstance(raw, str):
+                token = raw.strip().rstrip("uUlL")
+                try:
+                    as_u32 = int(token, 0) & 0xFFFFFFFF
+                    entry["uint"] = as_u32
+                    entry["int"] = struct.unpack("<i", struct.pack("<I", as_u32))[0]
+                    entry["float"] = struct.unpack("<f", struct.pack("<I", as_u32))[0]
+                except (ValueError, struct.error):
+                    pass
+            try:
+                slots[int(slot)] = entry
+            except (TypeError, ValueError):
+                slots[slot] = entry  # fall back to raw key
+        out["slots"] = slots
+    if binding.get("kind") == "32bit_constants_block":
+        out["block_raw"] = binding.get("raw")
+    return out
+
+
+@mcp.tool()
+async def pix_get_resource_bytes(
+    capture: str,
+    resource_id: int,
+    *,
+    offset: int = 0,
+    length: int | None = 256,
+    chunk_index: int = 0,
+    output_file: str | None = None,
+    preview_floats: int = 0,
+) -> dict[str, Any]:
+    """Read raw bytes from a resource's initial data in the C++ export.
+
+    PIX's ``export-to-cpp`` writes initial resource contents to a compressed
+    ``resources.bin`` sidecar. This tool reconstructs the read sequence from
+    the generated ``CreateAndInitResource_<id>()`` C++ definitions, locates the
+    chunk for ``resource_id``, decompresses it (XPRESS via Windows Cabinet
+    API), and returns the requested slice as a hex preview — and optionally
+    writes the full slice to ``output_file``.
+
+    Use this when ``pix_save_resource`` can't help you (it only emits visual
+    PNG/DDS); for raw cbuffer / vertex / index data, this is the path.
+
+    Args:
+        resource_id: PIX ApiObjectId of the resource (e.g. ``2362``).
+        offset:      byte offset into the decompressed resource.
+        length:      bytes to return; ``None`` = "everything from offset".
+                     Defaults to 256 to keep the response small.
+        chunk_index: 0-based index when a resource initializer does multiple
+                     Reads (e.g. a multi-subresource texture).
+        output_file: optional path to write the full slice to disk.
+        preview_floats: if >0, also decode the first N float32s and include
+                     them in the response (useful for cbuffer inspection).
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError(
+            "call pix_open_capture and pix_export_to_cpp first."
+        )
+    rb = sess.ensure_resources_bin()
+    chunks = rb.chunks(resource_id)
+    if not chunks:
+        # Tell the caller exactly what IS known, so they can sanity-check the
+        # resource_id (PIX numbering doesn't always match RenderDoc/Nsight).
+        sample = rb.list_resources()[:20]
+        raise RuntimeError(
+            f"resource {resource_id} not found in resources.bin map "
+            f"(tracked: {len(rb.chunks_by_resource)} resources). "
+            f"Sample tracked IDs: {sample}"
+        )
+    data = rb.read_resource_bytes(
+        resource_id, offset=offset, length=length, chunk_index=chunk_index
+    )
+    info: dict[str, Any] = {
+        "resource_id": resource_id,
+        "chunk_index": chunk_index,
+        "chunk_count": len(chunks),
+        "offset": offset,
+        "length": len(data),
+        "hex_preview": _hex_preview(data, limit=length or 256),
+        "chunks": [
+            {
+                "file_offset": c.file_offset,
+                "compressed_size": c.compressed_size,
+                "source_function": c.source_function,
+                "source_file": c.source_file,
+            }
+            for c in chunks
+        ],
+    }
+    if preview_floats > 0:
+        floats = _decode_floats(data, preview_floats)
+        if floats is not None:
+            info["preview_floats"] = floats
+    if output_file:
+        out = Path(output_file).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        info["output_file"] = str(out)
+        info["output_bytes_written"] = len(data)
+    return info
+
+
+@mcp.tool()
+async def pix_list_tracked_resources(capture: str) -> dict[str, Any]:
+    """List every resource ID that ``pix_get_resource_bytes`` can read,
+    along with each chunk's compressed size and file offset.
+
+    Useful as a first sanity-check after ``pix_export_to_cpp`` — confirms
+    the resources.bin map built cleanly before you try to dump bytes.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    rb = sess.ensure_resources_bin()
+    rows: list[dict[str, Any]] = []
+    for rid in rb.list_resources():
+        chunks = rb.chunks(rid)
+        rows.append({
+            "resource_id": rid,
+            "chunk_count": len(chunks),
+            "total_compressed_bytes": sum(c.compressed_size for c in chunks),
+            "first_source_function": chunks[0].source_function if chunks else None,
+        })
+    return {
+        "count": len(rows),
+        "resources": rows,
+        "resources_bin_path": str(rb.bin_path),
+        "resources_bin_size": rb.bin_path.stat().st_size,
+        "bytes_walked_in_static_replay": rb.total_reads_walked,
+        "unresolved_callees_sample": rb.unresolved_callees[:20],
+    }
+
+
+@mcp.tool()
+async def pix_dump_cbuffer_at_root_param(
+    capture: str,
+    global_id: int,
+    root_param_index: int,
+    *,
+    pipeline: str = "graphics",
+    length: int = 256,
+    preview_floats: int = 64,
+    output_file: str | None = None,
+) -> dict[str, Any]:
+    """End-to-end: 'what bytes are in the cbuffer at root param N of event G?'
+
+    Combines ``pix_state_at_event``, the parsed ``GetGpuva(resource_id,
+    offset)`` extraction, and ``pix_get_resource_bytes`` into a single call
+    that replaces the multi-click PIX-UI workflow.
+
+    Fails if the root param isn't a root CBV/SRV/UAV at that event — root
+    descriptor tables are indirect (a descriptor heap slot referring to a
+    resource), and this tool doesn't yet chase descriptor heap state.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    export = sess.ensure_cpp_export()
+    state = cpp_export.state_at_event(export, global_id=global_id, inclusive=True)
+    if not state.found_global_id:
+        sample = sorted({e.global_id for e in export.events[:5000] if e.global_id is not None})[:10]
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "pipeline": pipeline,
+            "found_global_id": False,
+            "error": (
+                f"global_id {global_id} not found in the parsed C++ export. "
+                "PIX assigns Global IDs across all queues including "
+                "barriers/markers, but the C++ export only contains "
+                "command-list calls. Try pix_get_event to confirm the gid "
+                "exists, or pix_find_cpp_calls to locate a nearby call."
+            ),
+            "sample_known_gids": sample,
+        }
+    table = (
+        state.graphics.root_params
+        if pipeline == "graphics"
+        else state.compute.root_params
+    )
+    binding = table.get(root_param_index)
+    if binding is None:
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "pipeline": pipeline,
+            "found_global_id": True,
+            "error": "no binding at that root param at that event",
+            "bound_root_params": sorted(table.keys()),
+        }
+    kind = binding.get("kind")
+    # 32-bit root constants: the values were already captured at bind time —
+    # decode them in-place instead of erroring.
+    if kind in ("32bit_constants", "32bit_constants_block"):
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "pipeline": pipeline,
+            "found_global_id": True,
+            "binding": binding,
+            "constants": _decode_32bit_constants(binding),
+            "note": (
+                "this is a root 32-bit constants slot — values come from the "
+                "Set*Root32BitConstant{,s} calls captured directly, not from "
+                "resources.bin."
+            ),
+        }
+    if kind not in ("cbv", "srv", "uav"):
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "pipeline": pipeline,
+            "found_global_id": True,
+            "binding": binding,
+            "error": (
+                f"binding kind {kind!r} is not a root descriptor "
+                "— descriptor tables resolve via descriptor heap inspection "
+                "(not yet supported). Use pix_get_root_signature_layout to "
+                "see the table layout."
+            ),
+        }
+    resource_id = binding.get("resource_id")
+    offset = binding.get("offset")
+    if resource_id is None or offset is None:
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "binding": binding,
+            "error": (
+                "binding GPU VA isn't a GetGpuva(rid, off) literal — can't "
+                "resolve resource_id + offset statically."
+            ),
+        }
+    rb = sess.ensure_resources_bin()
+    if resource_id not in rb.chunks_by_resource:
+        return {
+            "global_id": global_id,
+            "root_param_index": root_param_index,
+            "binding": binding,
+            "error": (
+                f"resource {resource_id} not tracked in resources.bin map "
+                "(no CreateAndInitResource_<id> found in the export)."
+            ),
+        }
+    data = rb.read_resource_bytes(resource_id, offset=offset, length=length)
+    out: dict[str, Any] = {
+        "global_id": global_id,
+        "root_param_index": root_param_index,
+        "pipeline": pipeline,
+        "binding": binding,
+        "resource_id": resource_id,
+        "offset": offset,
+        "length": len(data),
+        "hex_preview": _hex_preview(data, limit=length),
+    }
+    if preview_floats > 0:
+        floats = _decode_floats(data, preview_floats)
+        if floats is not None:
+            out["preview_floats"] = floats
+    if output_file:
+        op = Path(output_file).expanduser()
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_bytes(data)
+        out["output_file"] = str(op)
+    return out
+
+
+@mcp.tool()
+async def pix_get_root_signature_layout(
+    capture: str,
+    root_sig_obj_id: int,
+) -> dict[str, Any]:
+    """Parse the inline ``D3D12_ROOT_PARAMETER1`` definition for a root
+    signature and return its per-root-param layout.
+
+    PIX's export-to-cpp doesn't store the serialized root sig blob — it
+    re-emits the desc inline as a sequence of ``rootParameters[K].* = ...``
+    assignments wrapped in a block ending with ``CreateAndTrackRootSignature
+    (<id>, ...)``. We locate that block by ApiObjectId and unpack:
+
+      * ``kind``: ``DESCRIPTOR_TABLE`` / ``CBV`` / ``SRV`` / ``UAV`` / ``32BIT_CONSTANTS``
+      * ``visibility``: ``ALL`` / ``VERTEX`` / ``PIXEL`` / ``HULL`` / ``DOMAIN`` / ``GEOMETRY`` / ``AMPLIFICATION`` / ``MESH``
+      * For root descriptors: ``shader_register``, ``register_space``, ``flags``
+      * For 32-bit constants: ``shader_register``, ``register_space``, ``num_32bit_values``
+      * For descriptor tables: ordered ``descriptor_ranges`` list with each
+        range's type / num / base register / space / flags / offset
+
+    Pair this with ``pix_get_resource_at_root_param`` (resource bound to a
+    root descriptor) or with descriptor-heap inspection (root descriptor
+    table) to fully understand what each slot's shader sees.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    export = sess.ensure_cpp_export()
+    layout = cpp_export.parse_root_signature_layout(export, root_sig_obj_id)
+    if layout is None:
+        return {
+            "found": False,
+            "root_signature_id": root_sig_obj_id,
+            "reason": (
+                f"no CreateAndTrackRootSignature({root_sig_obj_id}, ...) call "
+                "found in the parsed C++ export. Check the ID with "
+                "pix_find_cpp_calls(method='CreateAndTrackRootSignature')."
+            ),
+        }
+    return {
+        "found": True,
+        "root_signature_id": layout.root_signature_id,
+        "source_file": layout.source_file,
+        "source_line": layout.source_line,
+        "flags": layout.flags,
+        # Truncated copy of the inline C++ block PIX generated, so callers can
+        # verify the structured output against the source text without
+        # re-grepping the export.
+        "raw_block_excerpt": layout.raw_block_excerpt,
+        "params": [
+            {
+                "index": p.index,
+                "kind": p.kind,
+                "visibility": p.visibility,
+                "shader_register": p.shader_register,
+                "register_space": p.register_space,
+                "num_32bit_values": p.num_32bit_values,
+                "flags": p.flags,
+                "descriptor_ranges": [
+                    {
+                        "range_type": r.range_type,
+                        "num_descriptors": r.num_descriptors,
+                        "base_shader_register": r.base_shader_register,
+                        "register_space": r.register_space,
+                        "flags": r.flags,
+                        "offset_in_descriptors": r.offset_in_descriptors,
+                    }
+                    for r in p.descriptor_ranges
+                ],
+            }
+            for p in layout.params
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# shader bytecode + disassembly
+# ---------------------------------------------------------------------------
+
+
+def _stage_list(layout: cpp_export.PsoStageLayout) -> list[dict[str, Any]]:
+    return [
+        {
+            "stage": s.stage,
+            "offset": s.offset,
+            "length": s.length,
+            "source_line": s.source_line,
+        }
+        for s in layout.stages
+    ]
+
+
+@mcp.tool()
+async def pix_list_psos(
+    capture: str,
+    *,
+    has_stage: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List every PSO in the export with its shader-stage layout.
+
+    Each PSO has one combined bytecode blob in ``resources.bin`` that the
+    generated C++ slices into per-stage views (``pssDesc.VS = { ..., LEN }``
+    etc.). We return the per-stage offsets/lengths so callers know what they
+    can dump.
+
+    Args:
+        has_stage: only return PSOs that contain this stage (e.g. ``"CS"`` to
+                   list compute-only PSOs).
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    export = sess.ensure_cpp_export()
+    layouts = cpp_export.list_all_psos(export)
+    if has_stage:
+        want = has_stage.upper()
+        layouts = [L for L in layouts if any(s.stage == want for s in L.stages)]
+    rows: list[dict[str, Any]] = []
+    for L in layouts[:limit]:
+        rows.append({
+            "pso_id": L.pso_id,
+            "root_signature_id": L.root_signature_id,
+            "compressed_blob_size": L.compressed_blob_size,
+            "stages": _stage_list(L),
+            "source_file": L.source_file,
+            "source_line": L.source_line,
+        })
+    return {
+        "count": len(rows),
+        "total_psos": len(cpp_export.list_all_psos(export)) if has_stage else len(layouts),
+        "psos": rows,
+    }
+
+
+@mcp.tool()
+async def pix_get_pso_stage_layout(
+    capture: str,
+    pso_id: int,
+) -> dict[str, Any]:
+    """Return the per-stage byte offsets/lengths inside a single PSO's blob.
+
+    This is the canonical "what shaders does this PSO have" lookup. Pair the
+    output with ``pix_dump_shader_bytecode`` or ``pix_disassemble_shader``
+    to extract / inspect individual stages.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    export = sess.ensure_cpp_export()
+    layout = cpp_export.parse_pso_shader_stages(export, pso_id)
+    if layout is None:
+        return {
+            "found": False,
+            "pso_id": pso_id,
+            "reason": (
+                f"no CreatePipelineState_{pso_id}() found in the export. Check "
+                "with pix_list_psos() to see what PSO ids are available."
+            ),
+        }
+    return {
+        "found": True,
+        "pso_id": layout.pso_id,
+        "root_signature_id": layout.root_signature_id,
+        "compressed_blob_size": layout.compressed_blob_size,
+        "stages": _stage_list(layout),
+        "source_file": layout.source_file,
+        "source_line": layout.source_line,
+    }
+
+
+def _load_pso_blob(
+    sess: Any, pso_id: int
+) -> tuple[cpp_export.PsoStageLayout, bytes]:
+    """Decompress a PSO's bytecode blob from resources.bin.
+
+    Returns (layout, decompressed_blob_bytes). Raises if the PSO can't be
+    located or its chunk isn't tracked.
+    """
+    export = sess.ensure_cpp_export()
+    layout = cpp_export.parse_pso_shader_stages(export, pso_id)
+    if layout is None:
+        raise RuntimeError(
+            f"no CreatePipelineState_{pso_id}() found in the export."
+        )
+    rb = sess.ensure_resources_bin()
+    pso_chunks = rb.chunks_by_pso.get(pso_id)
+    if not pso_chunks:
+        sample = sorted(rb.chunks_by_pso.keys())[:10]
+        raise RuntimeError(
+            f"PSO {pso_id} not tracked in resources.bin walker. "
+            f"Tracked PSO IDs sample: {sample}"
+        )
+    blob = rb.read_chunk(pso_chunks[0])
+    return layout, blob
+
+
+@mcp.tool()
+async def pix_dump_shader_bytecode(
+    capture: str,
+    pso_id: int,
+    stage: str,
+    *,
+    output_file: str | None = None,
+) -> dict[str, Any]:
+    """Extract one shader stage's bytecode from a PSO and (optionally) save it
+    as a ``.cso``.
+
+    The returned bytecode is the raw DXBC/DXIL container suitable for
+    ``dxc.exe -dumpbin`` or any DXBC tool. If ``output_file`` is provided the
+    full bytecode is written there; otherwise only the header bytes are
+    surfaced (full bytecode would blow up the MCP response).
+
+    Args:
+        pso_id: PSO ApiObjectId (e.g. ``852``).
+        stage:  ``"VS"`` | ``"PS"`` | ``"CS"`` | ``"HS"`` | ``"DS"`` | ``"GS"``
+                | ``"AS"`` | ``"MS"``.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    layout, blob = _load_pso_blob(sess, pso_id)
+    want = stage.upper()
+    match = next((s for s in layout.stages if s.stage == want), None)
+    if match is None:
+        return {
+            "pso_id": pso_id,
+            "requested_stage": stage,
+            "error": f"PSO {pso_id} has no {want} stage. Available: "
+                     f"{[s.stage for s in layout.stages]}",
+        }
+    bytecode = shaders.extract_shader_bytes(blob, match.offset, match.length)
+    fmt = shaders.detect_shader_format(bytecode)
+    info: dict[str, Any] = {
+        "pso_id": pso_id,
+        "stage": want,
+        "byte_length": len(bytecode),
+        "container_format": fmt,
+        "header_hex": _hex_preview(bytecode[:32], limit=32),
+        "blob_offset_within_pso": match.offset,
+        "source_line": match.source_line,
+    }
+    if output_file:
+        op = Path(output_file).expanduser()
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_bytes(bytecode)
+        info["output_file"] = str(op)
+        info["bytes_written"] = len(bytecode)
+    return info
+
+
+@mcp.tool()
+async def pix_disassemble_shader(
+    capture: str,
+    pso_id: int,
+    stage: str,
+    *,
+    output_file: str | None = None,
+    head_lines: int = 400,
+    prefer: str = "auto",
+) -> dict[str, Any]:
+    """Disassemble one shader stage of a PSO and return the asm/IR text.
+
+    Uses ``dxc.exe -dumpbin`` (default) which handles both DXIL (SM6+) and
+    legacy DXBC containers. To force the FXC disassembler instead, pass
+    ``prefer="fxc"`` (legacy DXBC only).
+
+    Args:
+        head_lines: cap the response at this many lines of disassembly to
+                    keep tool output manageable. Pass ``0`` for the full text.
+                    Use ``output_file`` if you need the whole disassembly on
+                    disk regardless.
+        prefer:     ``"auto"`` | ``"dxc"`` | ``"fxc"``.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    layout, blob = _load_pso_blob(sess, pso_id)
+    want = stage.upper()
+    match = next((s for s in layout.stages if s.stage == want), None)
+    if match is None:
+        return {
+            "pso_id": pso_id,
+            "requested_stage": stage,
+            "error": f"PSO {pso_id} has no {want} stage. Available: "
+                     f"{[s.stage for s in layout.stages]}",
+        }
+    bytecode = shaders.extract_shader_bytes(blob, match.offset, match.length)
+    result = shaders.disassemble_shader(bytecode, prefer=prefer)
+    text = result.text or ""
+    lines = text.splitlines()
+    truncated = False
+    if head_lines and head_lines > 0 and len(lines) > head_lines:
+        text = "\n".join(lines[:head_lines])
+        truncated = True
+    info: dict[str, Any] = {
+        "pso_id": pso_id,
+        "stage": want,
+        "container_format": result.container_format,
+        "disassembler": result.disassembler,
+        "disassembler_tool": result.disassembler_tool,
+        "returncode": result.returncode,
+        "stderr_tail": result.stderr_tail,
+        "byte_length": len(bytecode),
+        "total_lines": len(lines),
+        "truncated": truncated,
+        "disassembly": text,
+    }
+    if output_file:
+        op = Path(output_file).expanduser()
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_text(result.text or "", encoding="utf-8")
+        info["output_file"] = str(op)
+        info["bytes_written"] = op.stat().st_size if op.is_file() else 0
+    return info
+
+
+@mcp.tool()
+async def pix_analyze_shader_cbuffer_reads(
+    capture: str,
+    pso_id: int,
+    stage: str,
+    *,
+    prefer: str = "auto",
+    cbuffer_slot: int | None = None,
+) -> dict[str, Any]:
+    """Disassemble a shader stage and surface which cbuffer rows it reads.
+
+    Each row in a D3D constant buffer is 16 bytes (4 floats). The returned
+    ``reads`` list answers "which 16-byte slices of cbN does the shader
+    actually touch", which is the question that motivated this entire
+    shader-extraction path: if compute pass A reads cb0 rows {5, 9, 14} and
+    compute pass B reads cb0 rows {5, 9, 14, 22}, then row 22 is where the
+    behavior diverges and the cbuffer-bytes inspection should focus there.
+
+    Args:
+        cbuffer_slot: optional filter — only return reads from this b<N> slot.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    layout, blob = _load_pso_blob(sess, pso_id)
+    want = stage.upper()
+    match = next((s for s in layout.stages if s.stage == want), None)
+    if match is None:
+        return {
+            "pso_id": pso_id,
+            "requested_stage": stage,
+            "error": f"PSO {pso_id} has no {want} stage. Available: "
+                     f"{[s.stage for s in layout.stages]}",
+        }
+    bytecode = shaders.extract_shader_bytes(blob, match.offset, match.length)
+    disasm = shaders.disassemble_shader(bytecode, prefer=prefer)
+    analysis = shaders.analyze_cbuffer_reads(disasm)
+    reads = analysis.reads
+    if cbuffer_slot is not None:
+        reads = [r for r in reads if r.cbuffer_slot == cbuffer_slot]
+    return {
+        "pso_id": pso_id,
+        "stage": want,
+        "container_format": analysis.container_format,
+        "disassembler": disasm.disassembler_tool,
+        "disassembler_returncode": disasm.returncode,
+        "declared_cbuffers": analysis.declared_cbuffers,
+        "total_load_sites": analysis.total_load_sites,
+        "reads": [
+            {
+                "cbuffer_slot": r.cbuffer_slot,
+                "register_space": r.register_space,
+                "row": r.row,
+                "byte_offset": r.byte_offset,
+                "occurrences": r.occurrences,
+                "kind": r.kind,
+            }
+            for r in reads
+        ],
+        "warnings": analysis.warnings,
+    }
+
+
+@mcp.tool()
+async def pix_analyze_shader_at_event(
+    capture: str,
+    global_id: int,
+    stage: str,
+    *,
+    pipeline: str = "auto",
+    cbuffer_slot: int | None = None,
+    prefer: str = "auto",
+) -> dict[str, Any]:
+    """End-to-end: 'which cbuffer rows does the shader bound at event G read?'
+
+    Replays C++ state up to ``global_id``, extracts the PSO ApiObjectId from
+    the active SetPipelineState binding, locates the requested stage's
+    bytecode in resources.bin, disassembles it, and returns the cbuffer-read
+    analysis. This is the one-call answer to "what does the compute shader
+    sample from cb0 in view 1's fog dispatch?"
+
+    Args:
+        pipeline: ``"auto"`` (try compute then graphics) | ``"graphics"``
+                  | ``"compute"``. Compute is the right choice for fog
+                  volume dispatches.
+    """
+    sess, _wpix = _resolve_wpix(capture)
+    if sess is None:
+        raise RuntimeError("call pix_open_capture and pix_export_to_cpp first.")
+    export = sess.ensure_cpp_export()
+    state = cpp_export.state_at_event(export, global_id=global_id, inclusive=True)
+    pso_raw: str | None
+    if pipeline == "compute":
+        pso_raw = state.compute.pso
+    elif pipeline == "graphics":
+        pso_raw = state.graphics.pso
+    else:
+        pso_raw = state.compute.pso or state.graphics.pso
+    pso_id = shaders.pso_id_from_state_value(pso_raw)
+    if pso_id is None:
+        return {
+            "global_id": global_id,
+            "error": (
+                f"no PSO bound at event {global_id} (pipeline={pipeline}). "
+                f"compute.pso={state.compute.pso!r}, graphics.pso={state.graphics.pso!r}"
+            ),
+        }
+    inner = await pix_analyze_shader_cbuffer_reads(
+        capture, pso_id, stage,
+        prefer=prefer, cbuffer_slot=cbuffer_slot,
+    )
+    inner["resolved_pso_id"] = pso_id
+    inner["resolved_pso_raw"] = pso_raw
+    inner["target_global_id"] = global_id
+    inner["applied_calls"] = state.applied_calls
+    return inner
 
 
 # ---------------------------------------------------------------------------

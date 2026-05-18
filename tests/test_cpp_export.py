@@ -128,3 +128,177 @@ def test_find_calls_filters(tmp_path: Path) -> None:
     by_args = cpp_export.find_calls(exp, args_substring="BaseGpuDescriptor + 80")
     assert len(by_args) == 1
     assert by_args[0].global_id == 201
+
+
+# A snippet that mirrors PIX 2603.25's real export — every previously-broken
+# pattern is represented:
+#   * `// GlobalId        = N` (not `// Event N`)
+#   * `GetCommandList(3)->Method(...)` receiver with parens
+#   * GlobalId block wraps multiple D3D12 calls in a single `{ ... }`
+#   * `GetGpuva(resource_id, offset)` literals for root descriptors
+PIX_2603_SAMPLE_CPP = textwrap.dedent(
+    """\
+    #include "pch.h"
+
+    void PopulateCommandList_3_1_0()
+    {
+        ThrowIfFailed(GetCommandList(3)->Reset(GetCommandAllocator(4).Get(), GetPipelineState(0)));
+
+        // GlobalId        = 32
+        {
+            GetCommandList(3)->SetGraphicsRootSignature(GetRootSignature(2361).Get());
+            GetCommandList(3)->SetPipelineState(GetPipelineState(2365).Get());
+            GetCommandList(3)->SetGraphicsRootConstantBufferView(3, GetGpuva(2362, 10240));
+            GetCommandList(3)->SetGraphicsRootConstantBufferView(5, GetGpuva(2362, 10240));
+            GetCommandList(3)->SetGraphicsRootConstantBufferView(6, GetGpuva(2362, 2408704));
+            GetCommandList(3)->SetGraphicsRootConstantBufferView(7, GetGpuva(523, 3594752));
+            GetCommandList(3)->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        }
+
+        GetCommandList(3)->Close();
+    }
+    """
+)
+
+
+def test_parses_pix_2603_format_with_paren_receiver(tmp_path: Path) -> None:
+    """Regression: PIX 2603.25's `GetCommandList(N)->Method(...)` receiver
+    syntax was unparseable by the previous regex (it expected a plain
+    identifier receiver), so root_params came back empty for real captures.
+    """
+    src = tmp_path / "frame.cpp"
+    src.write_text(PIX_2603_SAMPLE_CPP, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    methods = [e.method for e in exp.events]
+    assert methods.count("SetGraphicsRootConstantBufferView") == 4
+    assert "DrawIndexedInstanced" in methods
+
+
+def test_global_id_persists_across_multiple_calls_in_block(tmp_path: Path) -> None:
+    """PIX 2603.25 groups several D3D12 calls under one ``// GlobalId = N``,
+    inside a brace block. Every call in that block must inherit the id."""
+    src = tmp_path / "frame.cpp"
+    src.write_text(PIX_2603_SAMPLE_CPP, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    cbvs = [e for e in exp.events if e.method == "SetGraphicsRootConstantBufferView"]
+    assert len(cbvs) == 4
+    assert all(c.global_id == 32 for c in cbvs)
+
+
+def test_state_at_event_extracts_structured_gpuva(tmp_path: Path) -> None:
+    """``GetGpuva(rid, off)`` literals in root descriptor args are parsed into
+    structured ``resource_id`` / ``offset`` fields on the root_param entry."""
+    src = tmp_path / "frame.cpp"
+    src.write_text(PIX_2603_SAMPLE_CPP, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    state = cpp_export.state_at_event(exp, global_id=32, inclusive=True)
+    rp3 = state.graphics.root_params[3]
+    assert rp3["kind"] == "cbv"
+    assert rp3["resource_id"] == 2362
+    assert rp3["offset"] == 10240
+    assert rp3["gpu_va"] == "GetGpuva(2362, 10240)"
+    rp7 = state.graphics.root_params[7]
+    assert rp7["resource_id"] == 523
+    assert rp7["offset"] == 3594752
+
+
+# Inline root signature definition mirroring PIX's exact emission style.
+PIX_ROOTSIG_SAMPLE = textwrap.dedent(
+    """\
+    #include "pch.h"
+
+    void CreateAppResources_000()
+    {
+        // ApiObjectId     = 2361
+        {
+            static D3D12_ROOT_PARAMETER1 rootParameters[4];
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            {
+                static D3D12_DESCRIPTOR_RANGE1 descriptorRanges[1];
+                descriptorRanges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 64, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 4294967295 };
+                rootParameters[0].DescriptorTable = { 1, descriptorRanges };
+            }
+            rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rootParameters[1].Descriptor = { 0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC };
+            rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+            rootParameters[2].Descriptor = { 2, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC };
+            rootParameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            rootParameters[3].Constants = { 5, 0, 16 };
+            D3D12_ROOT_SIGNATURE_DESC1 rootSignatureDesc = { 4, rootParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS };
+            CreateAndTrackRootSignature(2361, g_device.Get(), 1, signature.Get());
+        }
+    }
+    """
+)
+
+
+def test_parse_root_signature_layout(tmp_path: Path) -> None:
+    src = tmp_path / "rootsig.cpp"
+    src.write_text(PIX_ROOTSIG_SAMPLE, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    layout = cpp_export.parse_root_signature_layout(exp, 2361)
+    assert layout is not None
+    assert layout.root_signature_id == 2361
+    assert len(layout.params) == 4
+    p0, p1, p2, p3 = layout.params
+    # Descriptor table with one SRV range.
+    assert p0.kind == "DESCRIPTOR_TABLE"
+    assert p0.visibility == "PIXEL"
+    assert len(p0.descriptor_ranges) == 1
+    r = p0.descriptor_ranges[0]
+    assert r.range_type == "SRV"
+    assert r.num_descriptors == 64
+    assert r.base_shader_register == 0
+    assert r.register_space == 0
+    # Root CBVs.
+    assert p1.kind == "CBV" and p1.visibility == "PIXEL"
+    assert p1.shader_register == 0 and p1.register_space == 0
+    assert p2.kind == "CBV" and p2.visibility == "VERTEX"
+    assert p2.shader_register == 2
+    # 32-bit constants.
+    assert p3.kind == "32BIT_CONSTANTS"
+    assert p3.shader_register == 5
+    assert p3.num_32bit_values == 16
+    # Sig flags collected.
+    assert "D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT" in layout.flags
+    assert "D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS" in layout.flags
+
+
+def test_parse_root_signature_layout_missing_id(tmp_path: Path) -> None:
+    src = tmp_path / "rootsig.cpp"
+    src.write_text(PIX_ROOTSIG_SAMPLE, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    assert cpp_export.parse_root_signature_layout(exp, 9999) is None
+
+
+def test_state_at_event_flags_missing_global_id(tmp_path: Path) -> None:
+    """The old behavior silently fell back to 'state at end of frame' when
+    the requested global_id didn't exist in the export — callers had no way
+    to tell. Now StateAtEvent.found_global_id surfaces that."""
+    src = tmp_path / "frame.cpp"
+    src.write_text(PIX_2603_SAMPLE_CPP, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    real = cpp_export.state_at_event(exp, global_id=32, inclusive=True)
+    assert real.found_global_id is True
+    bogus = cpp_export.state_at_event(exp, global_id=99999, inclusive=True)
+    assert bogus.found_global_id is False
+    # Even when missing, the rest of the state shape is still populated
+    # (it just reflects end-of-frame state).
+    assert bogus.applied_calls == real.applied_calls
+
+
+def test_parser_captures_paren_receiver(tmp_path: Path) -> None:
+    """``GetCommandList(3)->Method(...)`` receiver should be recoverable from
+    the BindingEvent — used in pix_find_cpp_calls to tell which command list
+    a call targets."""
+    src = tmp_path / "frame.cpp"
+    src.write_text(PIX_2603_SAMPLE_CPP, encoding="utf-8")
+    exp = cpp_export.parse_export(tmp_path)
+    cbvs = [e for e in exp.events if e.method == "SetGraphicsRootConstantBufferView"]
+    assert cbvs and all(e.receiver == "GetCommandList(3)" for e in cbvs)
+    draws = [e for e in exp.events if e.method == "DrawIndexedInstanced"]
+    assert draws and draws[0].receiver == "GetCommandList(3)"

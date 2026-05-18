@@ -109,6 +109,59 @@ def build_cmdline(
     return parts
 
 
+def _pixtool_quote(arg: str) -> str:
+    """Quote a single argv entry for pixtool on Windows.
+
+    pixtool.exe's argument parser is fragile around quoted ``--option=value``
+    forms when ``value`` contains spaces. Python's default ``subprocess``
+    quoting via ``list2cmdline`` wraps the whole ``--option=value with spaces``
+    entry in double quotes (``"--option=value with spaces"``) — pixtool
+    sees this single quoted token and reports ``Unknown option 'option=...'``.
+
+    The working form (the one pixtool's manual examples and the Microsoft
+    docs use) is ``--option="value with spaces"`` — the inner quotes
+    around the value only. We split on the first ``=`` and quote only
+    the value half when it needs quoting.
+    """
+    if not arg:
+        return '""'
+    if arg.startswith("--") and "=" in arg:
+        flag, sep, value = arg.partition("=")
+        # Always quote value when it has spaces; never quote the --flag= portion.
+        if any(c in value for c in (" ", "\t")):
+            # Escape any inner double quotes by doubling them (Win32 convention)
+            value_escaped = value.replace('"', '""')
+            return f'{flag}{sep}"{value_escaped}"'
+        return arg
+    # Non-option arg: quote if it contains spaces.
+    if any(c in arg for c in (" ", "\t")):
+        return '"' + arg.replace('"', '""') + '"'
+    return arg
+
+
+def build_cmdline_str(
+    commands: Iterable[PixCommand],
+    *,
+    output_level: str | None = None,
+    log_level: str | None = None,
+    log_file: Path | str | None = None,
+    settings: Settings | None = None,
+) -> str:
+    """Build the cmdline as a single string with pixtool-friendly quoting.
+
+    Use this instead of passing a ``list`` to subprocess on Windows when
+    any option value contains spaces (e.g. ``--command-line="-foo -bar"``).
+    """
+    parts = build_cmdline(
+        commands,
+        output_level=output_level,
+        log_level=log_level,
+        log_file=log_file,
+        settings=settings,
+    )
+    return " ".join(_pixtool_quote(p) for p in parts)
+
+
 def run_pixtool(
     commands: Iterable[PixCommand],
     *,
@@ -129,10 +182,21 @@ def run_pixtool(
         log_file=log_file,
         settings=s,
     )
+    cmdline_str = build_cmdline_str(
+        commands,
+        output_level=output_level,
+        log_level=log_level,
+        log_file=log_file,
+        settings=s,
+    )
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
-            cmdline,
+            # Pass as STRING (not list) so Windows uses CreateProcessW directly
+            # without list2cmdline re-quoting. See _pixtool_quote for the
+            # rationale — pixtool's parser can't accept the default
+            # ``"--option=value with spaces"`` form list2cmdline produces.
+            cmdline_str,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=str(cwd) if cwd else None,
@@ -145,7 +209,7 @@ def run_pixtool(
     except subprocess.TimeoutExpired as exc:
         raise PixtoolError(
             f"pixtool timed out after {exc.timeout}s\n"
-            f"cmdline: {' '.join(shlex.quote(p) for p in cmdline)}"
+            f"cmdline: {cmdline_str}"
         ) from exc
     dt = time.monotonic() - t0
     result = PixtoolResult(
@@ -244,8 +308,18 @@ def start_background_pixtool(
         log_file=log_file,
         settings=settings,
     )
+    cmdline_str = build_cmdline_str(
+        commands,
+        output_level=output_level,
+        log_level=log_level,
+        log_file=log_file,
+        settings=settings,
+    )
     proc = subprocess.Popen(
-        cmdline,
+        # See run_pixtool: pass cmdline as STRING so option values with
+        # spaces (e.g. --command-line="-foo -bar") reach pixtool in the
+        # only form its parser accepts.
+        cmdline_str,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd else None,

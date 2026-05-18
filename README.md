@@ -51,8 +51,12 @@ because they operate on an indexed view of the capture:
 | `pix_query_sql` | Read-only SELECT/WITH against the index DB. |
 | `pix_parse_cpp_export` | Parse an existing `export-to-cpp` directory. |
 | `pix_state_at_event` | Replay the C++ export and return every bound state at a target event. |
-| `pix_get_resource_at_root_param` | "what's at graphics root param N of event G?" |
+| `pix_get_resource_at_root_param` | "what's at graphics root param N of event G?" — includes structured `resource_id` + `offset` when the binding is `GetGpuva(rid, off)`. |
 | `pix_find_cpp_calls` | Search the parsed C++ export for specific D3D12 calls and their *exact* arguments. |
+| `pix_get_root_signature_layout` | Parse the inline `D3D12_ROOT_PARAMETER1` array and return per-slot `{kind, visibility, register, register_space, descriptor_ranges, flags}` for a given root sig ApiObjectId. |
+| `pix_get_resource_bytes` | Read raw bytes from a resource at `(offset, length)` by decompressing `resources.bin` (XPRESS via Windows Cabinet API). Solves the "save-resource only does PNG/DDS" gap. |
+| `pix_list_tracked_resources` | List every resource ID `pix_get_resource_bytes` can read, with chunk sizes and source-function names. |
+| `pix_dump_cbuffer_at_root_param` | End-to-end "show me these cbuffer bytes": composes state replay + GpuVa parsing + raw-bytes extraction. Returns hex + optional float[] decoding. |
 | `pix_capture_summary` | One-shot high-level overview of a capture. |
 
 ## Install
@@ -167,7 +171,39 @@ pix_top_by_counter(capture="<h>", counter="gpu_duration", n=20, event_type="draw
 pix_recapture_region(capture="<h>", output_wpix="C:/captures/mygame_slice.wpix", start=2300, end=2600)
 ```
 
-### 7. Escape hatch — chain arbitrary pixtool commands
+### 7. Dump raw cbuffer bytes from a draw call (no PIX UI)
+
+```
+pix_export_to_cpp(capture="<h>", output_dir="C:/captures/mygame_cpp",
+                  use_winpixeventruntime=True, use_agility_sdk=True)
+
+# One call replaces ~10 PIX-UI clicks:
+pix_dump_cbuffer_at_root_param(
+    capture="<h>", global_id=2372, root_param_index=3,
+    length=256, preview_floats=64,
+    output_file="C:/scratch/basepass_cbuffer.bin",
+)
+# → {
+#     "resource_id": 2362,
+#     "offset": 2259712,
+#     "hex_preview": "00 00 80 3b ...",
+#     "preview_floats": [0.00390625, 0.0, ...],
+#     "output_file": "C:/scratch/basepass_cbuffer.bin"
+# }
+```
+
+For lower-level access:
+
+```
+pix_get_root_signature_layout(capture="<h>", root_sig_obj_id=2361)
+# → per-slot {kind, visibility, register, ranges, flags}
+
+pix_get_resource_bytes(capture="<h>", resource_id=2362,
+                       offset=2259712, length=256)
+pix_list_tracked_resources(capture="<h>")
+```
+
+### 8. Escape hatch — chain arbitrary pixtool commands
 
 ```
 pix_raw(args=[
@@ -255,7 +291,11 @@ src/pix_mcp/
   pixtool.py       # pixtool.exe subprocess wrapper (sync + async + background)
   csv_parser.py    # streaming parser for save-event-list CSV
   index.py         # SQLite indexer + query helpers
-  cpp_export.py    # regex parser + state replay for export-to-cpp
+  cpp_export.py    # parser + state replay for export-to-cpp;
+                   # also root-signature-layout extraction
+  resources_bin.py # static call-graph walk over CreateAndInitResource_*
+                   # functions + XPRESS decompression of resources.bin
+                   # (uses Windows Cabinet API via ctypes)
   session.py       # in-memory capture / launch session registry
   server.py        # FastMCP server with all tools
   __main__.py      # console entry point

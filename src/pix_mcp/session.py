@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import cpp_export, index
+from . import cpp_export, index, resources_bin
 from .pixtool import BackgroundProcess
 
 
@@ -38,6 +38,9 @@ class CaptureSession:
     cpp_export_dir: Path | None = None
     cpp_export_parsed: cpp_export.CppExport | None = None
     cpp_export_fingerprint: str | None = None
+    # Lazily-built map of (resource_id -> compressed chunk in resources.bin).
+    # Built the first time we need to read raw bytes from the export.
+    resources_bin: resources_bin.ResourceBin | None = None
     indexed: bool = False
     indexed_at: float | None = None
     last_index_stats: dict[str, Any] | None = None
@@ -66,7 +69,22 @@ class CaptureSession:
         if self.cpp_export_parsed is None or self.cpp_export_fingerprint != fp:
             self.cpp_export_parsed = cpp_export.parse_export(self.cpp_export_dir)
             self.cpp_export_fingerprint = fp
+            # The bytes map is fingerprint-keyed too: any change to the export
+            # dir invalidates it.
+            self.resources_bin = None
         return self.cpp_export_parsed
+
+    def ensure_resources_bin(self) -> resources_bin.ResourceBin:
+        if self.cpp_export_dir is None:
+            raise RuntimeError(
+                "no C++ export attached to this session. "
+                "Call pix_export_to_cpp first."
+            )
+        if self.resources_bin is None:
+            self.resources_bin = resources_bin.ResourceBin.from_export(
+                self.cpp_export_dir
+            )
+        return self.resources_bin
 
 
 @dataclass
